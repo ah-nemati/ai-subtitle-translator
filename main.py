@@ -1,139 +1,496 @@
 import os
-import time
+import re
+import math
 import asyncio
+import aiohttp
 from dotenv import load_dotenv
-import google.generativeai as genai
 
-# --- Load Environment Variables ---
+# =========================================================
+# ENV
+# =========================================================
+
 load_dotenv()
-API_KEY = os.getenv("GEMINI_API_KEY")
+
 INPUT_DIR = os.getenv("INPUT_DIR")
 OUTPUT_DIR = os.getenv("OUTPUT_DIR")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+OPENROUTER_URL = os.getenv("OPENROUTER_URL")
 
-# --- Validate environment ---
-if not API_KEY or not INPUT_DIR or not OUTPUT_DIR:
-    raise ValueError("⛔ لطفاً متغیرهای GEMINI_API_KEY، INPUT_DIR و OUTPUT_DIR را در فایل .env تنظیم کنید.")
+if not INPUT_DIR:
+    raise ValueError("INPUT_DIR تنظیم نشده است.")
 
-genai.configure(api_key=API_KEY)
+if not OUTPUT_DIR:
+    raise ValueError("OUTPUT_DIR تنظیم نشده است.")
 
-# --- Constants ---
-MODEL_NAME = "gemini-2.0-flash"
+if not OPENROUTER_API_KEY:
+    raise ValueError("OPENROUTER_API_KEY تنظیم نشده است.")
+
+if not OPENROUTER_URL:
+    raise ValueError("OPENROUTER_URL تنظیم نشده است.")
+
+
+# =========================================================
+# Models
+# =========================================================
+
+MODELS = [
+    {
+        "name": "openai/gpt-oss-120b:free",
+        "context": 131000,
+        "max_output": 8000,
+        "temperature": 0.1,
+    },
+    {
+        "name": "google/gemma-4-31b:free",
+        "context": 262000,
+        "max_output": 8000,
+        "temperature": 0.1,
+    },
+    {
+        "name": "google/gemma-4-26b-a4b:free",
+        "context": 262000,
+        "max_output": 8000,
+        "temperature": 0.1,
+    }
+]
+
+# =========================================================
+# Config
+# =========================================================
+
 MAX_RETRIES = 5
-LINES_PER_BATCH = 400
+
+REQUEST_TIMEOUT = 180
+
+SUPPORTED_FORMATS = (".srt", ".vtt")
+
+MAX_CONCURRENT_REQUESTS = 2
+
+# نسبت تقریبی
+# هر 1 token ≈ 3.5 chars
+TOKEN_CHAR_RATIO = 3.5
+
+# برای جلوگیری از overflow
+SAFE_CONTEXT_PERCENT = 0.55
+
+# =========================================================
+# Prompt
+# =========================================================
+
+SYSTEM_PROMPT = """
+شما مترجم حرفه‌ای زیرنویس فیلم و سریال هستید.
+
+قوانین بسیار مهم:
+
+- ساختار subtitle باید کاملاً حفظ شود
+- شماره‌ها نباید تغییر کنند
+- timestamp ها نباید تغییر کنند
+- فقط متن دیالوگ ترجمه شود
+- ترجمه باید روان، طبیعی و محاوره‌ای باشد
+- ترجمه تحت‌اللفظی نباشد
+- هیچ توضیح اضافه ننویس
+- markdown ننویس
+- فقط subtitle نهایی را برگردان
+- هیچ متنی غیر از subtitle خروجی نده
+"""
+
+# =========================================================
+# Helpers
+# =========================================================
+
+def is_supported_subtitle(filename: str):
+
+    return filename.lower().endswith(
+        SUPPORTED_FORMATS
+    )
 
 
-# --- Detect subtitle format ---
-def detect_format(filename):
-    if filename.endswith('.srt'):
-        return 'srt'
-    elif filename.endswith('.vtt'):
-        return 'vtt'
-    return None
+def load_subtitle(path: str):
 
-
-# --- Load subtitle file ---
-def load_subtitle_text(path):
-    with open(path, 'r', encoding='utf-8') as f:
+    with open(path, "r", encoding="utf-8") as f:
         return f.read()
 
 
-# --- Build translation prompt ---
-def build_translation_prompt(batch_text):
-    return (
-        "شما یک مترجم حرفه‌ای زیرنویس هستید. لطفاً دیالوگ‌های انگلیسی موجود در این فایل زیرنویس را به فارسی استاندارد و روان ترجمه کنید.\n"
-        "در ترجمه دقت کنید:\n"
-        "- فقط دیالوگ‌ها را ترجمه کنید، شماره خطوط، زمان‌ها و ساختار کلی فایل را تغییر ندهید.\n"
-        "- جملات را طوری ترجمه کنید که برای مخاطب فارسی‌زبان طبیعی به نظر برسند.\n"
-        "- اگر اصطلاح، محاوره یا فرهنگ خاصی وجود دارد، آن را به درستی بازتولید کنید.\n"
-        "- از ترجمهٔ لفظی و مستقیم خودداری کنید.\n"
-        "- طول جملات را مناسب با زمان‌های زیرنویس حفظ کنید (بهتر است خیلی طولانی نباشند).\n\n"
-        f"{batch_text.strip()}\n\n"
-        "---\n"
-        "فقط فایل زیرنویس با دیالوگ‌های ترجمه شده، بدون هیچ توضیح یا اضافه‌ای."
+def save_subtitle(output_path: str, content: str):
+
+    os.makedirs(
+        os.path.dirname(output_path),
+        exist_ok=True
     )
 
-# --- Translate a batch ---
-async def translate_batch(batch_lines):
-    batch_text = "\n".join(batch_lines)
-    prompt = build_translation_prompt(batch_text)
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write(content)
 
-    generation_config = genai.GenerationConfig(
-        max_output_tokens=8192,
-        temperature=0.2
+
+# =========================================================
+# Prompt Builder
+# =========================================================
+
+def build_translation_prompt(text: str):
+
+    return f"""
+زیرنویس زیر را به فارسی روان و طبیعی ترجمه کن.
+
+قوانین:
+- ساختار subtitle حفظ شود
+- timestamp ها تغییر نکنند
+- شماره‌ها تغییر نکنند
+- فقط دیالوگ ترجمه شود
+
+Subtitle:
+----------------
+
+{text}
+
+----------------
+"""
+
+
+# =========================================================
+# Token Estimation
+# =========================================================
+
+def estimate_tokens(text: str):
+
+    return math.ceil(
+        len(text) / TOKEN_CHAR_RATIO
     )
 
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            chat = genai.GenerativeModel(MODEL_NAME).start_chat()
-            print(chat.send_message(prompt, generation_config=generation_config))
-            response = chat.send_message(prompt, generation_config=generation_config)
-            translated_text = response.text.strip()
-            return translated_text.splitlines()
-        except Exception as e:
-            print(f"❌ خطا در تلاش {attempt} برای ترجمه batch: {str(e)}")
-            if "429" in str(e) or "quota" in str(e).lower():
-                await asyncio.sleep(3)
-            else:
-                await asyncio.sleep(5)
-    print("⛔ ترجمه batch ناموفق بود.")
-    return batch_lines  # Return original if failed
+
+# =========================================================
+# Dynamic Batch Splitter
+# =========================================================
+
+def dynamic_split_subtitle(
+    subtitle_text: str,
+    model_context: int,
+    reserved_output_tokens: int
+):
+
+    safe_input_tokens = int(
+        model_context * SAFE_CONTEXT_PERCENT
+    )
+
+    safe_input_tokens -= reserved_output_tokens
+
+    max_chars = int(
+        safe_input_tokens * TOKEN_CHAR_RATIO
+    )
+
+    subtitle_blocks = re.split(
+        r"\n\s*\n",
+        subtitle_text.strip()
+    )
+
+    batches = []
+
+    current_batch = []
+
+    current_chars = 0
+
+    for block in subtitle_blocks:
+
+        block_size = len(block)
+
+        if (
+            current_chars + block_size > max_chars
+            and current_batch
+        ):
+
+            batches.append(
+                "\n\n".join(current_batch)
+            )
+
+            current_batch = []
+
+            current_chars = 0
+
+        current_batch.append(block)
+
+        current_chars += block_size
+
+    if current_batch:
+
+        batches.append(
+            "\n\n".join(current_batch)
+        )
+
+    return batches
 
 
-# --- Save translated file ---
-def save_translated_file(original_file_path, input_root, output_root, translated_lines):
-    relative_path = os.path.relpath(original_file_path, input_root)
-    base, ext = os.path.splitext(relative_path)
+# =========================================================
+# Translation Request
+# =========================================================
 
-    if "_en" in base:
-        new_base = base.replace("_en", "")
-    else:
-        new_base = base + ""
+async def try_model(
+    session,
+    model,
+    prompt
+):
 
-    output_file = new_base + ext
-    output_path = os.path.join(output_root, output_file)
+    headers = {
+        "Authorization": (
+            f"Bearer {OPENROUTER_API_KEY}"
+        ),
+        "Content-Type": "application/json",
+    }
 
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    with open(output_path, 'w', encoding='utf-8') as f:
-        f.write("\n".join(translated_lines))
-    print(f"✅ فایل ذخیره شد: {output_path}")
+    payload = {
+        "model": model["name"],
+
+        "provider": {
+            "allow_fallbacks": True
+        },
+
+        "messages": [
+            {
+                "role": "system",
+                "content": SYSTEM_PROMPT
+            },
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ],
+
+        "temperature": model["temperature"],
+
+        "top_p": 0.9,
+
+        "max_tokens": model["max_output"],
+    }
+
+    async with session.post(
+        OPENROUTER_URL,
+        headers=headers,
+        json=payload,
+        timeout=aiohttp.ClientTimeout(
+            total=REQUEST_TIMEOUT
+        )
+    ) as response:
+
+        text = await response.text()
+
+        if response.status != 200:
+
+            raise Exception(
+                f"{response.status} => {text}"
+            )
+
+        data = await response.json()
+
+        if "choices" not in data:
+
+            raise Exception(
+                f"Invalid response => {data}"
+            )
+
+        translated = (
+            data["choices"][0]
+            ["message"]
+            ["content"]
+            .strip()
+        )
+
+        if not translated:
+
+            raise Exception("Empty response")
+
+        return translated
 
 
-# --- Process subtitle file ---
-async def process_file(file_path, input_root, output_root):
-    fmt = detect_format(file_path)
-    if not fmt:
-        print(f"⛔ فرمت پشتیبانی نمی‌شود: {file_path}")
-        return
+# =========================================================
+# Translation Logic
+# =========================================================
 
-    print(f"\n📄 در حال پردازش فایل: {file_path}")
-    original_text = load_subtitle_text(file_path)
-    lines = original_text.splitlines()
+async def translate_batch(
+    session,
+    batch_text
+):
 
-    total_lines = len(lines)
-    print(f"📚 تعداد کل خطوط: {total_lines}")
+    prompt = build_translation_prompt(
+        batch_text
+    )
 
-    translated_lines = []
+    for model in MODELS:
 
-    for i in range(0, total_lines, LINES_PER_BATCH):
-        batch = lines[i:i + LINES_PER_BATCH]
-        print(f"🔄 ترجمه batch {i // LINES_PER_BATCH + 1}: {len(batch)} خط")
-        translated_batch = await translate_batch(batch)
-        translated_lines.extend(translated_batch)
-        await asyncio.sleep(2)
+        print(
+            f"\n🤖 Trying model: {model['name']}"
+        )
 
-    save_translated_file(file_path, input_root, output_root, translated_lines)
+        for attempt in range(
+            1,
+            MAX_RETRIES + 1
+        ):
+
+            try:
+
+                translated = await try_model(
+                    session,
+                    model,
+                    prompt
+                )
+
+                print(
+                    f"✅ Success: {model['name']}"
+                )
+
+                return translated
+
+            except Exception as e:
+
+                print(
+                    f"❌ {model['name']} | Attempt {attempt}"
+                )
+
+                print(e)
+
+                wait_time = min(
+                    attempt * 3,
+                    15
+                )
+
+                print(
+                    f"⏳ Retry after {wait_time}s"
+                )
+
+                await asyncio.sleep(wait_time)
+
+    print("⚠️ همه مدل‌ها fail شدند")
+
+    return batch_text
 
 
-# --- Main execution ---
+# =========================================================
+# Process File
+# =========================================================
+
+async def process_file(
+    session,
+    semaphore,
+    file_path
+):
+
+    async with semaphore:
+
+        print(
+            f"\n📄 Processing: {file_path}"
+        )
+
+        subtitle_content = load_subtitle(
+            file_path
+        )
+
+        primary_model = MODELS[0]
+
+        batches = dynamic_split_subtitle(
+            subtitle_content,
+            primary_model["context"],
+            primary_model["max_output"]
+        )
+
+        print(
+            f"📦 Total batches: {len(batches)}"
+        )
+
+        translated_parts = []
+
+        for index, batch_text in enumerate(
+            batches,
+            start=1
+        ):
+
+            print(
+                f"\n🔄 Batch {index}/{len(batches)}"
+            )
+
+            estimated_tokens = estimate_tokens(
+                batch_text
+            )
+
+            print(
+                f"🧠 Estimated Tokens: {estimated_tokens}"
+            )
+
+            translated = await translate_batch(
+                session,
+                batch_text
+            )
+
+            translated_parts.append(
+                translated
+            )
+
+            await asyncio.sleep(1)
+
+        final_content = "\n\n".join(
+            translated_parts
+        )
+
+        relative_path = os.path.relpath(
+            file_path,
+            INPUT_DIR
+        )
+
+        output_path = os.path.join(
+            OUTPUT_DIR,
+            relative_path
+        )
+
+        save_subtitle(
+            output_path,
+            final_content
+        )
+
+        print(
+            f"\n✅ Saved: {output_path}"
+        )
+
+
+# =========================================================
+# Main
+# =========================================================
+
 async def main():
-    for root, _, files in os.walk(INPUT_DIR):
-        for file in files:
-            if file.endswith(('.srt', '.vtt')):
-                full_path = os.path.join(root, file)
-                await process_file(full_path, INPUT_DIR, OUTPUT_DIR)
-                await asyncio.sleep(1)
+
+    connector = aiohttp.TCPConnector(
+        limit=MAX_CONCURRENT_REQUESTS
+    )
+
+    semaphore = asyncio.Semaphore(
+        MAX_CONCURRENT_REQUESTS
+    )
+
+    async with aiohttp.ClientSession(
+        connector=connector
+    ) as session:
+
+        tasks = []
+
+        for root, _, files in os.walk(
+            INPUT_DIR
+        ):
+
+            for file in files:
+
+                if is_supported_subtitle(file):
+
+                    file_path = os.path.join(
+                        root,
+                        file
+                    )
+
+                    tasks.append(
+                        process_file(
+                            session,
+                            semaphore,
+                            file_path
+                        )
+                    )
+
+        await asyncio.gather(*tasks)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
 
+    asyncio.run(main())
