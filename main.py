@@ -5,6 +5,7 @@ import time
 import random
 import asyncio
 import logging
+from collections import deque
 from typing import List, Dict, Optional
 
 import aiohttp
@@ -18,7 +19,44 @@ load_dotenv()
 
 INPUT_DIR = os.getenv("INPUT_DIR")
 OUTPUT_DIR = os.getenv("OUTPUT_DIR")
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+
+def _load_api_keys() -> List[str]:
+
+    keys = []
+
+    multi = os.getenv("OPENROUTER_API_KEYS", "")
+
+    if multi:
+
+        keys = [
+            k.strip()
+            for k in multi.split(",")
+            if k.strip()
+        ]
+
+    if not keys:
+
+        i = 1
+
+        while True:
+
+            suffix = "" if i == 1 else f"_{i}"
+
+            key = os.getenv(
+                f"OPENROUTER_API_KEY{suffix}",
+                ""
+            )
+
+            if not key:
+                break
+
+            keys.append(key)
+
+            i += 1
+
+    return keys
+
+API_KEYS = _load_api_keys()
 
 # =========================================================
 # VALIDATION
@@ -30,8 +68,12 @@ if not INPUT_DIR:
 if not OUTPUT_DIR:
     raise Exception("OUTPUT_DIR missing")
 
-if not OPENROUTER_API_KEY:
-    raise Exception("OPENROUTER_API_KEY missing")
+if not API_KEYS:
+    raise Exception(
+        "No API keys found. "
+        "Set OPENROUTER_API_KEY or "
+        "OPENROUTER_API_KEYS=k1,k2,... in .env"
+    )
 
 # =========================================================
 # CONFIG
@@ -39,13 +81,21 @@ if not OPENROUTER_API_KEY:
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
-MAX_CONCURRENCY = 1
+# هر key جداگانه ۲۰ RPM داره (محدودیت OpenRouter free)
+# MAX_CONCURRENCY = تعداد keyها × ریکوست موازی هر key
+RPM_PER_KEY = 20
+
+RPM_SAFETY  = 0.85          # ۸۵٪ ظرفیت برای جلوگیری از 429
+
+MAX_CONCURRENCY = len(API_KEYS) * 3
 
 MAX_RETRIES_PER_MODEL = 5
 
 REQUEST_TIMEOUT = 300
 
 COOLDOWN_BASE = 30
+
+COOLDOWN_ON_429 = 65        # ثانیه - وقتی 429 گرفتیم
 
 MAX_CHARS_PER_CHUNK = 1200
 
@@ -67,16 +117,22 @@ logger = logging.getLogger(
     "NetflixSubtitlePipeline"
 )
 
+logger.info(
+    f"Loaded {len(API_KEYS)} API key(s) | "
+    f"MAX_CONCURRENCY: {MAX_CONCURRENCY}"
+)
+
 # =========================================================
 # MODELS
 # =========================================================
 
 MODELS = [
     "openai/gpt-oss-120b:free",
-    "google/gemini-2.5-flash-lite:free",
-    "deepseek/deepseek-chat:free",
+    "deepseek/deepseek-v4-flash:free",
+    "nvidia/nemotron-3-super-120b-a12b:free",
+    "meta-llama/llama-3.3-70b-instruct:free",
+    "google/gemma-4-31b-it:free",
     "qwen/qwen3-next-80b-a3b-instruct:free",
-    "meta-llama/llama-4-maverick:free",
     "openrouter/free",
 ]
 
@@ -96,6 +152,192 @@ model_stats = {
 
     for model in MODELS
 }
+
+# =========================================================
+# KEY POOL  (sliding-window rate limiter per key)
+# =========================================================
+
+class _KeySlot:
+    """یه API key با sliding-window rate limiter مستقل."""
+
+    def __init__(self, key: str):
+
+        self.key            = key
+        self.label          = f"...{key[-8:]}"
+        self._lock          = asyncio.Lock()
+        self._timestamps    = deque()   # زمان ریکوست‌های ۶۰ثانیه اخیر
+        self.cooldown_until = 0.0
+        self.daily_count    = 0
+        self.fails          = 0
+
+    async def acquire(self):
+        """
+        منتظر میمونه تا rate limit اجازه بده،
+        سپس slot رو برای یه ریکوست رزرو میکنه.
+        """
+
+        while True:
+
+            async with self._lock:
+
+                now = time.monotonic()
+
+                if self.cooldown_until > now:
+
+                    wait = self.cooldown_until - now
+
+                else:
+
+                    cutoff = now - 60.0
+
+                    while (
+                        self._timestamps
+                        and self._timestamps[0] < cutoff
+                    ):
+                        self._timestamps.popleft()
+
+                    limit = int(RPM_PER_KEY * RPM_SAFETY)
+
+                    if len(self._timestamps) < limit:
+
+                        self._timestamps.append(now)
+
+                        return  # ✅ مجاز به ارسال
+
+                    wait = (
+                        self._timestamps[0] + 60.0
+                    ) - now + 0.1
+
+            await asyncio.sleep(wait)
+
+    def mark_success(self):
+
+        self.fails       = 0
+        self.daily_count += 1
+
+    def mark_429(self):
+
+        self.fails          += 1
+        self.cooldown_until  = (
+            time.monotonic() + COOLDOWN_ON_429
+        )
+
+        logger.warning(
+            f"Key {self.label}: "
+            f"429 → cooldown {COOLDOWN_ON_429}s"
+        )
+
+    def mark_error(self):
+
+        self.fails          += 1
+        cooldown             = COOLDOWN_BASE * (2 ** (self.fails - 1))
+        self.cooldown_until  = time.monotonic() + cooldown
+
+        logger.warning(
+            f"Key {self.label}: "
+            f"error → cooldown {cooldown}s"
+        )
+
+    def mark_dead(self):
+        """
+        key کاملاً غیرفعال میشه (401 / نامعتبر).
+        دیگه هیچ‌وقت انتخاب نمیشه.
+        """
+
+        self.cooldown_until = float("inf")
+
+        logger.error(
+            f"Key {self.label}: "
+            f"DEAD — removed from pool (invalid key)"
+        )
+
+    @property
+    def is_available(self) -> bool:
+
+        return self.cooldown_until <= time.monotonic()
+
+
+class KeyPool:
+    """
+    Pool از API keyها.
+    pick() بهترین key موجود رو برمیگردونه
+    و rate limiter اون key رو lock میکنه.
+    """
+
+    def __init__(self, keys: List[str]):
+
+        self._slots = [_KeySlot(k) for k in keys]
+        self._lock  = asyncio.Lock()
+
+    async def pick(self) -> _KeySlot:
+        """
+        یه slot سالم انتخاب میکنه (کمترین fail،
+        خارج از cooldown) و acquire میکنه.
+        """
+
+        while True:
+
+            async with self._lock:
+
+                available = [
+                    s for s in self._slots
+                    if s.is_available
+                ]
+
+                if available:
+
+                    slot = min(
+                        available,
+                        key=lambda s: (
+                            s.fails,
+                            s.daily_count
+                        )
+                    )
+
+                else:
+
+                    slot = min(
+                        self._slots,
+                        key=lambda s: s.cooldown_until
+                    )
+
+                    wait = (
+                        slot.cooldown_until
+                        - time.monotonic()
+                    )
+
+                    logger.warning(
+                        f"All keys cooling down. "
+                        f"Waiting {wait:.1f}s"
+                    )
+
+                    await asyncio.sleep(wait)
+
+                    continue
+
+            # acquire خارج از lock انجام میشه
+            await slot.acquire()
+
+            return slot
+
+    def log_status(self):
+
+        for s in self._slots:
+
+            cd = max(
+                0.0,
+                s.cooldown_until - time.monotonic()
+            )
+
+            logger.info(
+                f"Key {s.label}: "
+                f"today={s.daily_count}, "
+                f"fails={s.fails}, "
+                f"cooldown={cd:.0f}s"
+            )
+
+
+key_pool = KeyPool(API_KEYS)
 
 # =========================================================
 # SYSTEM PROMPT
@@ -367,6 +609,18 @@ def mark_fail(model):
         f"{model} cooldown {cooldown}s"
     )
 
+def mark_model_dead(model):
+    """
+    مدل کاملاً از دسترس خارج میشه (404 / وجود نداره).
+    دیگه هیچ‌وقت انتخاب نمیشه.
+    """
+
+    model_stats[model]["cooldown_until"] = float("inf")
+
+    logger.error(
+        f"Model DEAD — removed from pool: {model}"
+    )
+
 # =========================================================
 # JSON RECOVERY
 # =========================================================
@@ -577,6 +831,7 @@ def extract_json(
 async def call_model(
     session,
     model,
+    api_key,
     payload
 ):
 
@@ -587,7 +842,7 @@ async def call_model(
         headers={
 
             "Authorization":
-                f"Bearer {OPENROUTER_API_KEY}",
+                f"Bearer {api_key}",
 
             "Content-Type":
                 "application/json"
@@ -602,6 +857,24 @@ async def call_model(
     ) as response:
 
         text = await response.text()
+
+        if response.status == 429:
+
+            raise Exception(
+                f"HTTP 429 RATE_LIMIT: {text[:150]}"
+            )
+
+        if response.status == 401:
+
+            raise Exception(
+                f"HTTP 401 INVALID_KEY: {text[:150]}"
+            )
+
+        if response.status == 404:
+
+            raise Exception(
+                f"HTTP 404 MODEL_DEAD: {text[:150]}"
+            )
 
         if response.status != 200:
 
@@ -676,6 +949,8 @@ async def translate_chunk(
 
         model = pick_model()
 
+        slot = await key_pool.pick()
+
         try:
 
             payload = dict(payload_base)
@@ -683,12 +958,14 @@ async def translate_chunk(
             payload["model"] = model
 
             logger.info(
+                f"[Key {slot.label}] "
                 f"Trying model: {model}"
             )
 
             raw = await call_model(
                 session,
                 model,
+                slot.key,
                 payload
             )
 
@@ -701,7 +978,10 @@ async def translate_chunk(
 
                 mark_success(model)
 
+                slot.mark_success()
+
                 logger.info(
+                    f"[Key {slot.label}] "
                     f"SUCCESS: {model}"
                 )
 
@@ -713,9 +993,34 @@ async def translate_chunk(
 
         except Exception as e:
 
-            logger.error(str(e))
+            err = str(e)
 
-            mark_fail(model)
+            logger.error(
+                f"[Key {slot.label}] {err}"
+            )
+
+            if "429" in err or "RATE_LIMIT" in err:
+
+                slot.mark_429()
+
+                mark_fail(model)
+
+            elif "401" in err or "INVALID_KEY" in err:
+
+                slot.mark_dead()
+
+                mark_fail(model)
+
+            elif "404" in err or "MODEL_DEAD" in err:
+
+                # key مشکلی نداره، فقط این مدل وجود نداره
+                mark_model_dead(model)
+
+            else:
+
+                slot.mark_error()
+
+                mark_fail(model)
 
             await asyncio.sleep(
                 random.uniform(3, 8)
@@ -999,6 +1304,10 @@ async def main():
     logger.info(
         "ALL TASKS FINISHED"
     )
+
+    logger.info("Key pool final stats:")
+
+    key_pool.log_status()
 
 # =========================================================
 # START
