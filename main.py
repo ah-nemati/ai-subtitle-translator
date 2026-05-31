@@ -20,6 +20,11 @@ load_dotenv()
 INPUT_DIR = os.getenv("INPUT_DIR")
 OUTPUT_DIR = os.getenv("OUTPUT_DIR")
 
+# روش ۱ - کاما جدا:  OPENROUTER_API_KEYS=sk-key1,sk-key2,sk-key3
+# روش ۲ - numbered:  OPENROUTER_API_KEY=sk-key1
+#                     OPENROUTER_API_KEY_2=sk-key2
+#                     OPENROUTER_API_KEY_3=sk-key3
+
 def _load_api_keys() -> List[str]:
 
     keys = []
@@ -97,12 +102,30 @@ COOLDOWN_BASE = 30
 
 COOLDOWN_ON_429 = 65        # ثانیه - وقتی 429 گرفتیم
 
+# این مدل از محدودیت روزانه معاف است
+# وقتی key به daily quota رسید، فقط از این مدل استفاده میکنه
+UNLIMITED_MODEL = "openai/gpt-oss-120b:free"
+
+# اگه همه keyها کاملاً dead شدن (401)، pipeline متوقف بشه
+DAILY_EXHAUSTED_THRESHOLD = 3600  # ۱ ساعت
+
 MAX_CHARS_PER_CHUNK = 1200
 
 SUPPORTED_EXTENSIONS = (
     ".srt",
     ".vtt"
 )
+
+# =========================================================
+# EXCEPTIONS
+# =========================================================
+
+class AllKeysExhaustedError(Exception):
+    """
+    وقتی همه API keyها quota روزانه‌شون تموم شده.
+    pipeline باید متوقف بشه.
+    """
+    pass
 
 # =========================================================
 # LOGGING
@@ -153,6 +176,12 @@ model_stats = {
     for model in MODELS
 }
 
+# هر مدل همزمان حداکثر ۲ ریکوست موازی میگیره
+# جلوگیری از اینکه چند chunk همه روی یه مدل بریزن
+MODEL_MAX_CONCURRENT = 2
+
+model_semaphores: dict = {}  # بعد از event loop شروع شد پر میشه
+
 # =========================================================
 # KEY POOL  (sliding-window rate limiter per key)
 # =========================================================
@@ -169,6 +198,9 @@ class _KeySlot:
         self.cooldown_until = 0.0
         self.daily_count    = 0
         self.fails          = 0
+        # وقتی quota روزانه تموم شد، زمان reset رو نگه میداره
+        # key نمیمیره — فقط به UNLIMITED_MODEL محدود میشه
+        self.daily_quota_reset_at = 0.0
 
     async def acquire(self):
         """
@@ -216,26 +248,59 @@ class _KeySlot:
         self.daily_count += 1
 
     def mark_429(self):
+        """
+        per-minute rate limit — کوتاه‌مدت.
+        fails رو افزایش نمیده تا cooldown نمایی نشه.
+        """
 
-        self.fails          += 1
-        self.cooldown_until  = (
+        self.cooldown_until = (
             time.monotonic() + COOLDOWN_ON_429
         )
 
         logger.warning(
             f"Key {self.label}: "
-            f"429 → cooldown {COOLDOWN_ON_429}s"
+            f"429 per-min → cooldown {COOLDOWN_ON_429}s"
         )
 
-    def mark_error(self):
+    def mark_daily_quota(self):
+        """
+        per-day quota تموم شده.
+        key نمیمیره — فقط به UNLIMITED_MODEL محدود میشه.
+        تا فردا فقط از مدل unlimited استفاده میکنه.
+        """
 
-        self.fails          += 1
-        cooldown             = COOLDOWN_BASE * (2 ** (self.fails - 1))
-        self.cooldown_until  = time.monotonic() + cooldown
+        self.daily_quota_reset_at = (
+            time.monotonic() + 86400
+        )
 
         logger.warning(
             f"Key {self.label}: "
-            f"error → cooldown {cooldown}s"
+            f"daily quota hit → "
+            f"restricted to {UNLIMITED_MODEL}"
+        )
+
+    @property
+    def daily_quota_hit(self) -> bool:
+        """
+        آیا این key به quota روزانه رسیده؟
+        اگه بله، فقط از UNLIMITED_MODEL استفاده میکنه.
+        """
+
+        return self.daily_quota_reset_at > time.monotonic()
+
+    def mark_error(self):
+        """
+        خطای موقت شبکه یا server.
+        cooldown کوتاه ثابت — بدون رشد نمایی.
+        """
+
+        self.cooldown_until = (
+            time.monotonic() + COOLDOWN_BASE
+        )
+
+        logger.warning(
+            f"Key {self.label}: "
+            f"error → cooldown {COOLDOWN_BASE}s"
         )
 
     def mark_dead(self):
@@ -306,6 +371,22 @@ class KeyPool:
                         - time.monotonic()
                     )
 
+                    # اگه کمترین cooldown بیش از آستانه بود
+                    # یعنی همه keyها quota روزانه خوردن
+                    if wait > DAILY_EXHAUSTED_THRESHOLD:
+
+                        logger.error(
+                            f"ALL KEYS EXHAUSTED — "
+                            f"min wait: {wait/3600:.1f}h. "
+                            f"Stopping pipeline."
+                        )
+
+                        raise AllKeysExhaustedError(
+                            f"All API keys have exhausted "
+                            f"their daily quota. "
+                            f"Min wait: {wait/3600:.1f}h."
+                        )
+
                     logger.warning(
                         f"All keys cooling down. "
                         f"Waiting {wait:.1f}s"
@@ -329,11 +410,18 @@ class KeyPool:
                 s.cooldown_until - time.monotonic()
             )
 
+            quota_status = (
+                "QUOTA_HIT"
+                if s.daily_quota_hit
+                else "ok"
+            )
+
             logger.info(
                 f"Key {s.label}: "
                 f"today={s.daily_count}, "
                 f"fails={s.fails}, "
-                f"cooldown={cd:.0f}s"
+                f"cooldown={cd:.0f}s, "
+                f"quota={quota_status}"
             )
 
 
@@ -860,8 +948,14 @@ async def call_model(
 
         if response.status == 429:
 
+            if "per-day" in text or "per_day" in text:
+
+                raise Exception(
+                    f"HTTP 429 DAILY_QUOTA: {text[:200]}"
+                )
+
             raise Exception(
-                f"HTTP 429 RATE_LIMIT: {text[:150]}"
+                f"HTTP 429 RATE_LIMIT: {text[:200]}"
             )
 
         if response.status == 401:
@@ -949,82 +1043,106 @@ async def translate_chunk(
 
         model = pick_model()
 
+        # model semaphore رو lazy init کن (داخل event loop)
+        if model not in model_semaphores:
+
+            model_semaphores[model] = asyncio.Semaphore(
+                MODEL_MAX_CONCURRENT
+            )
+
         slot = await key_pool.pick()
 
-        try:
+        # اگه این key quota روزانه خورده،
+        # فقط از مدل unlimited استفاده میکنه
+        if slot.daily_quota_hit:
 
-            payload = dict(payload_base)
+            model = UNLIMITED_MODEL
 
-            payload["model"] = model
+            if model not in model_semaphores:
 
-            logger.info(
-                f"[Key {slot.label}] "
-                f"Trying model: {model}"
-            )
+                model_semaphores[model] = asyncio.Semaphore(
+                    MODEL_MAX_CONCURRENT
+                )
 
-            raw = await call_model(
-                session,
-                model,
-                slot.key,
-                payload
-            )
+        async with model_semaphores[model]:
 
-            result = extract_json(
-                raw,
-                expected_count
-            )
+            try:
 
-            if result:
+                payload = dict(payload_base)
 
-                mark_success(model)
-
-                slot.mark_success()
+                payload["model"] = model
 
                 logger.info(
                     f"[Key {slot.label}] "
-                    f"SUCCESS: {model}"
+                    f"Trying model: {model}"
                 )
 
-                return result
+                raw = await call_model(
+                    session,
+                    model,
+                    slot.key,
+                    payload
+                )
 
-            raise Exception(
-                "Invalid JSON output"
-            )
+                result = extract_json(
+                    raw,
+                    expected_count
+                )
 
-        except Exception as e:
+                if result:
 
-            err = str(e)
+                    mark_success(model)
 
-            logger.error(
-                f"[Key {slot.label}] {err}"
-            )
+                    slot.mark_success()
 
-            if "429" in err or "RATE_LIMIT" in err:
+                    logger.info(
+                        f"[Key {slot.label}] "
+                        f"SUCCESS: {model}"
+                    )
 
-                slot.mark_429()
+                    return result
 
-                mark_fail(model)
+                raise Exception(
+                    "Invalid JSON output"
+                )
 
-            elif "401" in err or "INVALID_KEY" in err:
+            except Exception as e:
 
-                slot.mark_dead()
+                err = str(e)
 
-                mark_fail(model)
+                logger.error(
+                    f"[Key {slot.label}] {err}"
+                )
 
-            elif "404" in err or "MODEL_DEAD" in err:
+                if "DAILY_QUOTA" in err:
 
-                # key مشکلی نداره، فقط این مدل وجود نداره
-                mark_model_dead(model)
+                    slot.mark_daily_quota()
 
-            else:
+                    mark_fail(model)
 
-                slot.mark_error()
+                elif "429" in err or "RATE_LIMIT" in err:
 
-                mark_fail(model)
+                    slot.mark_429()
 
-            await asyncio.sleep(
-                random.uniform(3, 8)
-            )
+                    mark_fail(model)
+
+                elif "401" in err or "INVALID_KEY" in err:
+
+                    slot.mark_dead()
+
+                    mark_fail(model)
+
+                elif "404" in err or "MODEL_DEAD" in err:
+
+                    mark_model_dead(model)
+
+                else:
+
+                    mark_fail(model)
+
+                    await asyncio.sleep(
+                        random.uniform(2, 5)
+                    )
 
     return None
 
@@ -1087,6 +1205,153 @@ def rebuild_subtitle(
         result = "WEBVTT\n\n" + result
 
     return result
+
+# =========================================================
+# CHUNK CACHE
+# =========================================================
+# بعد از هر chunk ترجمه‌شده، نتیجه رو در یه فایل json
+# کنار فایل خروجی ذخیره میکنیم.
+# اگه pipeline متوقف و restart بشه، chunkهای قبلی
+# از cache خونده میشن و دوباره ترجمه نمیشن.
+#
+# ساختار فایل cache:
+# {
+#   "total_chunks": 12,
+#   "chunks": {
+#     "0": ["ترجمه ۱", "ترجمه ۲", ...],
+#     "3": [...],
+#     ...
+#   }
+# }
+
+def _cache_path(output_path: str) -> str:
+
+    return output_path + ".cache.json"
+
+def load_chunk_cache(output_path: str) -> dict:
+    """
+    cache فایل رو میخونه و dict برمیگردونه.
+    اگه وجود نداشت یا خراب بود، dict خالی.
+    """
+
+    path = _cache_path(output_path)
+
+    try:
+
+        if not os.path.exists(path):
+            return {}
+
+        with open(
+            path,
+            "r",
+            encoding="utf-8"
+        ) as f:
+
+            data = json.load(f)
+
+        # کلیدها string هستن — تبدیل به int
+        chunks = {
+            int(k): v
+            for k, v in data.get("chunks", {}).items()
+        }
+
+        logger.info(
+            f"Cache loaded: "
+            f"{len(chunks)}/{data.get('total_chunks', '?')} "
+            f"chunks already done"
+        )
+
+        return {
+            "total_chunks": data.get("total_chunks", 0),
+            "chunks": chunks
+        }
+
+    except Exception:
+
+        logger.warning(
+            f"Cache read failed, starting fresh: {path}"
+        )
+
+        return {}
+
+def save_chunk_to_cache(
+    output_path: str,
+    chunk_index: int,
+    texts: List[str],
+    total_chunks: int
+):
+    """
+    یه chunk ترجمه‌شده رو به cache اضافه میکنه.
+    atomic write برای جلوگیری از خراب شدن فایل.
+    """
+
+    path = _cache_path(output_path)
+
+    try:
+
+        # cache موجود رو بخون
+        existing = {}
+
+        if os.path.exists(path):
+
+            with open(
+                path,
+                "r",
+                encoding="utf-8"
+            ) as f:
+
+                raw = json.load(f)
+
+            existing = {
+                int(k): v
+                for k, v in raw.get("chunks", {}).items()
+            }
+
+        existing[chunk_index] = texts
+
+        data = {
+            "total_chunks": total_chunks,
+            "chunks": {
+                str(k): v
+                for k, v in existing.items()
+            }
+        }
+
+        # atomic write با temp file
+        tmp_path = path + ".tmp"
+
+        with open(
+            tmp_path,
+            "w",
+            encoding="utf-8"
+        ) as f:
+
+            json.dump(data, f, ensure_ascii=False)
+
+        os.replace(tmp_path, path)
+
+    except Exception:
+
+        logger.warning(
+            f"Cache write failed for chunk {chunk_index}"
+        )
+
+def delete_chunk_cache(output_path: str):
+    """
+    بعد از نوشتن فایل نهایی، cache رو حذف میکنه.
+    """
+
+    path = _cache_path(output_path)
+
+    try:
+
+        if os.path.exists(path):
+
+            os.remove(path)
+
+    except Exception:
+
+        pass
 
 # =========================================================
 # PROCESS FILE
@@ -1154,20 +1419,55 @@ async def process_file(
                 subtitles
             )
 
+            total_chunks = len(chunks)
+
             logger.info(
-                f"Chunks: {len(chunks)}"
+                f"Chunks: {total_chunks}"
             )
+
+            # =====================================
+            # LOAD CHUNK CACHE
+            # =====================================
+
+            os.makedirs(
+                os.path.dirname(output_path),
+                exist_ok=True
+            )
+
+            cache = load_chunk_cache(output_path)
+
+            cached_chunks = cache.get("chunks", {})
 
             final_texts = []
 
-            for index, chunk in enumerate(
-                chunks,
-                start=1
-            ):
+            for index, chunk in enumerate(chunks):
+
+                chunk_num = index + 1
+
+                # =====================================
+                # CACHE HIT — skip this chunk
+                # =====================================
+
+                if index in cached_chunks:
+
+                    logger.info(
+                        f"Chunk {chunk_num}/{total_chunks} "
+                        f"[from cache]"
+                    )
+
+                    final_texts.extend(
+                        cached_chunks[index]
+                    )
+
+                    continue
+
+                # =====================================
+                # TRANSLATE
+                # =====================================
 
                 logger.info(
                     f"Chunk "
-                    f"{index}/{len(chunks)}"
+                    f"{chunk_num}/{total_chunks}"
                 )
 
                 translated = await translate_chunk(
@@ -1192,6 +1492,17 @@ async def process_file(
                 )
 
                 # =====================================
+                # SAVE CHUNK TO CACHE
+                # =====================================
+
+                save_chunk_to_cache(
+                    output_path,
+                    index,
+                    translated,
+                    total_chunks
+                )
+
+                # =====================================
                 # ANTI RATE LIMIT DELAY
                 # =====================================
 
@@ -1208,11 +1519,6 @@ async def process_file(
                 is_vtt=is_vtt
             )
 
-            os.makedirs(
-                os.path.dirname(output_path),
-                exist_ok=True
-            )
-
             with open(
                 output_path,
                 "w",
@@ -1224,6 +1530,17 @@ async def process_file(
             logger.info(
                 f"SAVED: {output_path}"
             )
+
+            # =====================================
+            # DELETE CACHE (فایل نهایی نوشته شد)
+            # =====================================
+
+            delete_chunk_cache(output_path)
+
+        except AllKeysExhaustedError:
+
+            # به main برسه تا همه taskها cancel بشن
+            raise
 
         except Exception:
 
@@ -1299,7 +1616,39 @@ async def main():
 
             return
 
-        await asyncio.gather(*tasks)
+        # create_task بجای coroutine مستقیم
+        # تا بشه در صورت نیاز cancel کرد
+        running_tasks = [
+            asyncio.create_task(coro)
+            for coro in tasks
+        ]
+
+        try:
+
+            await asyncio.gather(*running_tasks)
+
+        except AllKeysExhaustedError as e:
+
+            logger.error(
+                f"PIPELINE STOPPED: {e}"
+            )
+
+            logger.error(
+                "All API keys have used up their "
+                "daily quota. "
+                "Progress is saved in cache files. "
+                "Restart tomorrow to continue."
+            )
+
+            # همه taskهای در حال اجرا رو cancel کن
+            for t in running_tasks:
+
+                t.cancel()
+
+            await asyncio.gather(
+                *running_tasks,
+                return_exceptions=True
+            )
 
     logger.info(
         "ALL TASKS FINISHED"
